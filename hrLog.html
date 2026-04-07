@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>HypeRate 心率监控</title>
+    <link rel="icon" type="image/png" sizes="32x32" href="https://designer.hyperate.io/HypeRate_Logo_32.png" />
+    <link rel="stylesheet" crossorigin href="https://designer.hyperate.io/assets/index-CHQ-RtlS.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            background: #0b0f17;
+            color: #fff;
+            font-family: system-ui, -apple-system, sans-serif;
+        }
+        body::-webkit-scrollbar { display: none; }
+        #root {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+        .input-area {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            align-items: center;
+        }
+        .input-area input {
+            flex: 1;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: none;
+            font-size: 16px;
+            background: #141a28;
+            color: #fff;
+        }
+        .input-area button {
+            padding: 12px 24px;
+            border-radius: 8px;
+            border: none;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #connectBtn { background: #3b82f6; color: #fff; }
+        #connectBtn:hover { background: #2563eb; }
+        #disconnectBtn { background: #ef4444; color: #fff; }
+        #disconnectBtn:hover { background: #dc2626; }
+        .status {
+            font-size: 15px;
+            margin-bottom: 16px;
+            color: #94a3b8;
+        }
+        .heart-rate {
+            font-size: 80px;
+            font-weight: bold;
+            color: #ff4d4d;
+            margin: 20px 0;
+        }
+        .chart-container {
+            height: 400px;
+            margin: 32px 0;
+        }
+        #downloadBtn {
+            padding: 14px 28px;
+            background: #10b981;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #downloadBtn:hover { background: #059669; }
+    </style>
+</head>
+<body>
+<div id="root">
+    <h1>HypeRate 心率监控</h1>
+    <div class="input-area">
+        <input type="text" id="deviceIdInput" placeholder="输入设备ID，例如: pOi" value="pOi">
+        <button id="connectBtn" onclick="startConnect()">连接</button>
+        <button id="disconnectBtn" onclick="manualDisconnect()">断开</button>
+    </div>
+    <div class="status" id="statusText">未连接</div>
+    <div class="heart-rate" id="currentHr">0</div>
+
+    <h3>近1分钟心率曲线</h3>
+    <div class="chart-container">
+        <canvas id="hrChart"></canvas>
+    </div>
+
+    <button id="downloadBtn" onclick="downloadCsv()">下载全量心率数据（CSV）</button>
+</div>
+
+<script>
+const WS_BASE_URL = "wss://app.hyperate.io/socket/websocket";
+const TOKEN = "astobRkornAHAizEZGIo3pVYBDHyrkEtw8v2AEP804fpQ0G4uRh0OHT3vtgBPTy2";
+const MAX_1MIN_POINTS = 30;
+
+let ws = null;
+let heartbeatTimer = null;
+let reconnectTimer = null;
+let refCounter = 20;
+let allRecords = [];
+let chart = null;
+let chartLabels = [];
+let chartData = [];
+let isManualStop = false;
+
+function initChart() {
+    const ctx = document.getElementById("hrChart").getContext("2d");
+    chart = new Chart(ctx, {
+        type: "line",
+        data: {
+            labels: chartLabels,
+            datasets: [{
+                label: "心率 (BPM)",
+                data: chartData,
+                borderColor: "#ff4d4d",
+                backgroundColor: "rgba(255, 77, 68, 0.12)",
+                tension: 0.4,
+                fill: true,
+                pointRadius: 3,
+                pointBackgroundColor: "#ff4d4d"
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                y: { min: 40, max: 200, grid: { color: "#334155" }, ticks: { color: "#f8fafc" } },
+                x: { grid: { color: "#334155" }, ticks: { color: "#f8fafc" } }
+            },
+            plugins: { legend: { labels: { color: "#f8fafc" } } }
+        }
+    });
+}
+
+function nextRef() {
+    return refCounter++;
+}
+
+// 核心：自动重连函数
+function connectWs(deviceId) {
+    if (ws) ws.close();
+    clearInterval(heartbeatTimer);
+    clearTimeout(reconnectTimer);
+
+    if (isManualStop) return;
+
+    const wsUrl = `${WS_BASE_URL}?token=${TOKEN}`;
+    const topic = `hr:${deviceId}`;
+
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+        setStatus("✅ 已连接，订阅频道中...");
+        ws.send(JSON.stringify({ topic, event: "phx_join", payload: {}, ref: nextRef() }));
+
+        heartbeatTimer = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ topic: "phoenix", event: "heartbeat", payload: {}, ref: nextRef() }));
+            }
+        }, 25000);
+    };
+
+    ws.onmessage = (evt) => {
+        try {
+            const msg = JSON.parse(evt.data);
+            if (msg.event === "hr_update" && msg.payload?.hr !== undefined) {
+                const hr = Number(msg.payload.hr);
+                const timeStr = new Date().toLocaleTimeString();
+                document.getElementById("currentHr").textContent = hr;
+                setStatus(`✅ 实时更新: ${timeStr}`);
+
+                allRecords.push({ time: timeStr, hr });
+                chartLabels.push(timeStr);
+                chartData.push(hr);
+                if (chartLabels.length > MAX_1MIN_POINTS) {
+                    chartLabels.shift();
+                    chartData.shift();
+                }
+                chart.update();
+            } else if (msg.event === "phx_reply" && msg.payload?.status === "ok") {
+                setStatus("✅ 订阅成功，等待心率数据...");
+            }
+        } catch (e) {}
+    };
+
+    // 断开后自动重连
+    ws.onclose = () => {
+        if (!isManualStop) {
+            setStatus("🔄 连接断开，2秒后自动重连...");
+            reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+        } else {
+            setStatus("❌ 已手动断开");
+        }
+    };
+
+    ws.onerror = () => {
+        if (!isManualStop) {
+            setStatus("⚠️ 连接错误，2秒后重连...");
+            reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+        }
+    };
+}
+
+function startConnect() {
+    const deviceId = document.getElementById("deviceIdInput").value.trim();
+    if (!deviceId) { alert("请输入设备ID"); return; }
+    isManualStop = false;
+    connectWs(deviceId);
+}
+
+function manualDisconnect() {
+    isManualStop = true;
+    clearInterval(heartbeatTimer);
+    clearTimeout(reconnectTimer);
+    if (ws) ws.close();
+    setStatus("❌ 已手动断开");
+}
+
+function setStatus(text) {
+    document.getElementById("statusText").textContent = text;
+}
+
+function downloadCsv() {
+    if (allRecords.length === 0) { alert("暂无数据"); return; }
+    let csv = "时间,心率(BPM)\n";
+    allRecords.forEach(r => csv += `${r.time},${r.hr}\n`);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `hyperate_心率数据.csv`;
+    a.click();
+}
+
+window.onload = initChart;
+</script>
+</body>
+</html>
