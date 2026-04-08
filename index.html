@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>HypeRate 心率监控</title>
     <link rel="icon" type="image/png" sizes="32x32" href="https://designer.hyperate.io/HypeRate_Logo_32.png" />
     <link rel="stylesheet" crossorigin href="https://designer.hyperate.io/assets/index-CHQ-RtlS.css">
@@ -107,7 +107,7 @@
         <input type="text" id="deviceIdInput" placeholder="输入设备ID，例如: pOi" value="pOi">
         <button id="connectBtn" onclick="startConnect()">连接</button>
         <button id="disconnectBtn" onclick="manualDisconnect()">断开</button>
-        <select id="timeRangeSelect" onchange="refreshChart()">
+        <select id="timeRangeSelect" onchange="refreshAll()">
             <option value="1m">近 1 分钟</option>
             <option value="5m">近 5 分钟</option>
             <option value="10m">近 10 分钟</option>
@@ -142,174 +142,182 @@
 </div>
 
 <script>
-const WS_BASE_URL = "wss://app.hyperate.io/socket/websocket";
-const TOKEN = "astobRkornAHAizEZGIo3pVYBDHyrkEtw8v2AEP804fpQ0G4uRh0OHT3vtgBPTy2";
+    const WS_BASE_URL = "wss://app.hyperate.io/socket/websocket";
+    const TOKEN = "astobRkornAHAizEZGIo3pVYBDHyrkEtw8v2AEP804fpQ0G4uRh0OHT3vtgBPTy2";
 
-let ws = null;
-let heartbeatTimer = null;
-let reconnectTimer = null;
-let refCounter = 20;
-let allRecords = [];
-let chart = null;
-let isManualStop = false;
+    let ws = null;
+    let heartbeatTimer = null;
+    let reconnectTimer = null;
+    let refCounter = 20;
+    let allRecords = [];
+    let chart = null;
+    let isManualStop = false;
 
-const RANGE_CONFIG = {
-  "1m": 60,
-  "5m": 300,
-  "10m": 600,
-  "30m": 1800,
-  "all": null
-};
+    const RANGE_CONFIG = {
+        "1m": 60,
+        "5m": 300,
+        "10m": 600,
+        "30m": 1800,
+        "all": null
+    };
 
-function initChart() {
-  const ctx = document.getElementById("hrChart").getContext("2d");
-  chart = new Chart(ctx, {
-    type: "line",
-    data: { labels: [], datasets: [{
-      label: "心率 (BPM)",
-      data: [],
-      borderColor: "#ff4d4d",
-      backgroundColor: "rgba(255,77,77,0.12)",
-      tension: 0.4,
-      fill: true,
-      pointRadius: 3
-    }]},
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {
-        y: { min:40, max:200, grid: { color:"#334155" }, ticks: { color:"#f8fafc" }},
-        x: { grid: { color:"#334155" }, ticks: { color:"#f8fafc" }}
-      },
-      plugins: { legend: { labels: { color:"#f8fafc" }}}
+    // 初始化图表
+    function initChart() {
+        const ctx = document.getElementById("hrChart").getContext("2d");
+        chart = new Chart(ctx, {
+            type: "line",
+            data: { labels: [], datasets: [{
+                    label: "心率 (BPM)",
+                    data: [],
+                    borderColor: "#ff4d4d",
+                    backgroundColor: "rgba(255,77,77,0.12)",
+                    tension: 0.4,
+                    fill: true,
+                    pointRadius: 3
+                }]},
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: { min:40, max:200, grid: { color:"#334155" }, ticks: { color:"#f8fafc" }},
+                    x: { grid: { color:"#334155" }, ticks: { color:"#f8fafc" }}
+                },
+                plugins: { legend: { labels: { color:"#f8fafc" }}}
+            }
+        });
     }
-  });
-}
 
-function calcHrStats() {
-  if (allRecords.length === 0) {
-    document.getElementById('minHr').textContent = 0;
-    document.getElementById('avgHr').textContent = 0;
-    document.getElementById('maxHr').textContent = 0;
-    return;
-  }
-  const hrs = allRecords.map(i => i.hr);
-  const min = Math.min(...hrs);
-  const max = Math.max(...hrs);
-  const avg = (hrs.reduce((a,b)=>a+b,0)/hrs.length).toFixed(1);
-  document.getElementById('minHr').innerText = min;
-  document.getElementById('maxHr').innerText = max;
-  document.getElementById('avgHr').innerText = avg;
-}
+    // 获取当前筛选的数据
+    function getDisplayData() {
+        const key = document.getElementById("timeRangeSelect").value;
+        const sec = RANGE_CONFIG[key];
+        const now = Date.now();
 
-// ✅ 修复时间筛选逻辑
-function refreshChart() {
-  if (!chart) return;
-  const sel = document.getElementById("timeRangeSelect").value;
-  const limitSec = RANGE_CONFIG[sel];
-  const nowTs = Date.now();
+        if (!sec) return [...allRecords];
 
-  let displayList = allRecords;
-
-  if (limitSec) {
-    displayList = allRecords.filter(item => {
-      return (nowTs - item.ts) <= limitSec * 1000;
-    });
-  }
-
-  chart.data.labels = displayList.map(i => i.time);
-  chart.data.datasets[0].data = displayList.map(i => i.hr);
-  chart.update();
-}
-
-function nextRef() { return refCounter++; }
-
-function connectWs(deviceId) {
-  if (ws) ws.close();
-  clearInterval(heartbeatTimer);
-  clearTimeout(reconnectTimer);
-  if (isManualStop) return;
-
-  const wsUrl = `${WS_BASE_URL}?token=${TOKEN}`;
-  const topic = `hr:${deviceId}`;
-  ws = new WebSocket(wsUrl);
-
-  ws.onopen = () => {
-    setStatus("✅ 已连接，订阅频道...");
-    ws.send(JSON.stringify({ topic, event:"phx_join", payload:{}, ref:nextRef() }));
-    heartbeatTimer = setInterval(() => {
-      if (ws.readyState === 1) {
-        ws.send(JSON.stringify({ topic:"phoenix", event:"heartbeat", payload:{}, ref:nextRef() }));
-      }
-    }, 25000);
-  };
-
-  ws.onmessage = (e) => {
-    try {
-      const msg = JSON.parse(e.data);
-      if (msg.event === "hr_update" && msg.payload.hr != null) {
-        const hr = Number(msg.payload.hr);
-        const time = new Date().toLocaleTimeString();
-        const ts = Date.now();
-
-        document.getElementById("currentHr").innerText = hr;
-        setStatus(`✅ ${time}`);
-
-        allRecords.push({ time, hr, ts });
-        calcHrStats();
-        refreshChart();
-      }
-    } catch (e) {}
-  };
-
-  ws.onclose = () => {
-    if (!isManualStop) {
-      setStatus("🔄 断开，2秒后重连...");
-      reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+        return allRecords.filter(item => {
+            return now - item.ts <= sec * 1000;
+        });
     }
-  };
 
-  ws.onerror = () => {
-    if (!isManualStop) {
-      setStatus("⚠️ 错误，2秒后重连...");
-      reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+    // 刷新统计
+    function updateStats() {
+        const list = getDisplayData();
+        if (list.length === 0) {
+            document.getElementById("minHr").innerText = 0;
+            document.getElementById("avgHr").innerText = 0;
+            document.getElementById("maxHr").innerText = 0;
+            return;
+        }
+        const hrs = list.map(x => x.hr);
+        const min = Math.min(...hrs);
+        const max = Math.max(...hrs);
+        const avg = (hrs.reduce((a,b)=>a+b,0)/hrs.length).toFixed(1);
+
+        document.getElementById("minHr").innerText = min;
+        document.getElementById("avgHr").innerText = avg;
+        document.getElementById("maxHr").innerText = max;
     }
-  };
-}
 
-function startConnect() {
-  const id = document.getElementById("deviceIdInput").value.trim();
-  if (!id) return alert("输入ID");
-  isManualStop = false;
-  allRecords = [];
-  calcHrStats();
-  refreshChart();
-  connectWs(id);
-}
+    // 刷新图表
+    function updateChart() {
+        const list = getDisplayData();
+        chart.data.labels = list.map(x => x.time);
+        chart.data.datasets[0].data = list.map(x => x.hr);
+        chart.update();
+    }
 
-function manualDisconnect() {
-  isManualStop = true;
-  clearInterval(heartbeatTimer);
-  clearTimeout(reconnectTimer);
-  if (ws) ws.close();
-  setStatus("❌ 已断开");
-}
+    // 统一刷新
+    function refreshAll() {
+        updateChart();
+        updateStats();
+    }
 
-function setStatus(t) {
-  document.getElementById("statusText").innerText = t;
-}
+    // WS 连接
+    function connectWs(deviceId) {
+        if (ws) ws.close();
+        clearInterval(heartbeatTimer);
+        clearTimeout(reconnectTimer);
+        if (isManualStop) return;
 
-function downloadCsv() {
-  if (allRecords.length === 0) return alert("无数据");
-  let csv = "时间,心率(BPM)\n";
-  allRecords.forEach(i => csv += `${i.time},${i.hr}\n`);
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([csv],{type:"text/csv"}));
-  a.download = "hyperate_心率记录.csv";
-  a.click();
-}
+        const wsUrl = `${WS_BASE_URL}?token=${TOKEN}`;
+        const topic = `hr:${deviceId}`;
+        ws = new WebSocket(wsUrl);
 
-window.onload = initChart;
+        ws.onopen = () => {
+            setStatus("✅ 已连接，订阅频道...");
+            ws.send(JSON.stringify({ topic, event:"phx_join", payload:{}, ref:refCounter++ }));
+            heartbeatTimer = setInterval(() => {
+                if (ws.readyState === 1) {
+                    ws.send(JSON.stringify({ topic:"phoenix", event:"heartbeat", payload:{}, ref:refCounter++ }));
+                }
+            }, 25000);
+        };
+
+        ws.onmessage = (e) => {
+            try {
+                const msg = JSON.parse(e.data);
+                if (msg.event === "hr_update" && msg.payload.hr != null) {
+                    const hr = Number(msg.payload.hr);
+                    const time = new Date().toLocaleTimeString();
+                    const ts = Date.now();
+                    document.getElementById("currentHr").innerText = hr;
+                    setStatus(`✅ ${time}`);
+                    allRecords.push({ time, hr, ts });
+                    refreshAll();
+                }
+            } catch (e) {}
+        };
+
+        ws.onclose = () => {
+            if (!isManualStop) {
+                setStatus("🔄 断开，2秒后重连...");
+                reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+            }
+        };
+
+        ws.onerror = () => {
+            if (!isManualStop) {
+                setStatus("⚠️ 错误，2秒后重连...");
+                reconnectTimer = setTimeout(() => connectWs(deviceId), 2000);
+            }
+        };
+    }
+
+    function startConnect() {
+        const id = document.getElementById("deviceIdInput").value.trim();
+        if (!id) return alert("请输入设备ID");
+        isManualStop = false;
+        allRecords = [];
+        refreshAll();
+        connectWs(id);
+    }
+
+    function manualDisconnect() {
+        isManualStop = true;
+        clearInterval(heartbeatTimer);
+        clearTimeout(reconnectTimer);
+        if (ws) ws.close();
+        setStatus("❌ 已手动断开");
+    }
+
+    function setStatus(t) {
+        document.getElementById("statusText").innerText = t;
+    }
+
+    function downloadCsv() {
+        if (allRecords.length === 0) return alert("暂无数据");
+        let csv = "时间,心率(BPM)\n";
+        allRecords.forEach(item => {
+            csv += `${item.time},${item.hr}\n`;
+        });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+        a.download = "心率记录.csv";
+        a.click();
+    }
+
+    window.onload = initChart;
 </script>
 </body>
 </html>
